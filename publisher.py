@@ -16,6 +16,8 @@ import cloudinary.uploader
 from PIL import Image
 import requests
 
+import editorial
+
 KARACHI = ZoneInfo("Asia/Karachi")
 ACCOUNTS = {"iffat-nazir": "BUFFER_IFFAT_CHANNEL_ID", "itrvix": "BUFFER_ITRVIX_CHANNEL_ID"}
 SLOTS = {"10:00", "17:00"}
@@ -274,9 +276,44 @@ def submit(ledger, buffer, channel, key, due, caption, images):
         raise RuntimeError("Buffer did not confirm the expected scheduled post")
 
 
+def generated_posts(plan, day, directory):
+    if plan["date"] != day.isoformat():
+        raise editorial.EditorialError("Editorial plan does not match the requested date")
+    editorial.render_plan(plan, directory)
+    posts = load_day(directory, day)
+    if len({digest(image) for _, images in posts.values() for image in images}) != 12:
+        raise editorial.EditorialError("Expected twelve distinct editorial images")
+    if len({caption.split("\n", 1)[0].casefold() for caption, _ in posts.values()}) != 4:
+        raise editorial.EditorialError("A daily batch repeated a caption opening")
+    return posts
+
+
+def prepare_day(ledger, root, day):
+    plan_path = ledger.checkout / "editorial" / f"{day}.json"
+    if plan_path.is_file():
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    elif (root / day.isoformat() / "posts.json").is_file():
+        return load_day(root, day)
+    else:
+        if any(key.startswith(f"{day}/") for key in ledger.rows):
+            raise editorial.EditorialError("A day with existing reservations lacks its original editorial plan")
+        plan = editorial.generate_plan(day)
+    with tempfile.TemporaryDirectory() as directory:
+        posts = generated_posts(plan, day, Path(directory))
+    if not plan_path.is_file():
+        plan_path.parent.mkdir(exist_ok=True)
+        plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        git("add", str(plan_path), cwd=ledger.checkout)
+        ledger.save(f"Freeze reviewed LinkedIn content for {day}")
+    return posts
+
+
 def main():
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("validate", "run", "initialize"), nargs="?", default="validate")
+    parser.add_argument("operation", choices=("validate", "preview", "run", "initialize"), nargs="?", default="validate")
+    parser.add_argument("--date", type=date.fromisoformat, help="Karachi date for preview; defaults to tomorrow")
+    parser.add_argument("--output", type=Path, default=Path("editorial-preview"), help="Preview output directory")
     args = parser.parse_args()
     root = Path("content")
     if args.operation == "validate":
@@ -284,6 +321,12 @@ def main():
         for manifest in files:
             load_day(root, date.fromisoformat(manifest.parent.name))
         print(f"Validated {len(files)} dated content manifests")
+        return
+    if args.operation == "preview":
+        day = args.date or utc_now().astimezone(KARACHI).date() + timedelta(days=1)
+        args.output.mkdir(parents=True, exist_ok=True)
+        generated_posts(editorial.generate_plan(day), day, args.output)
+        print(f"Prepared four preview posts and twelve images for {day}")
         return
     if args.operation == "initialize":
         with open_ledger(initialize=True) as ledger:
@@ -303,10 +346,22 @@ def main():
         failures = refresh(ledger, buffer)
         buffer.check_channels(channels)
         for day in (today, tomorrow):
+            missing_slots = [(account, slot) for account, slot in EXPECTED
+                             if f"{day}/{account}/{slot}" not in ledger.rows]
+            for account, slot in missing_slots:
+                if due_at(day, slot) <= utc_now() + timedelta(minutes=5):
+                    key = f"{day}/{account}/{slot}"
+                    print(f"{key}: missed scheduling window")
+                    failures.append(key)
+            if not any(due_at(day, slot) > utc_now() + timedelta(minutes=5)
+                       for _, slot in missing_slots):
+                continue
             try:
-                posts = load_day(root, day)
-            except (OSError, ValueError, KeyError, TypeError) as error:
-                print(f"{day}: content unavailable or invalid ({type(error).__name__})")
+                posts = prepare_day(ledger, root, day)
+            except (OSError, ValueError, KeyError, TypeError, editorial.EditorialError,
+                    requests.RequestException) as error:
+                details = f": {error}" if isinstance(error, editorial.EditorialError) else ""
+                print(f"{day}: editorial batch unavailable ({type(error).__name__}){details}")
                 failures.append(day)
                 continue
             for (account, slot), (caption, images) in sorted(posts.items()):
@@ -315,8 +370,9 @@ def main():
                 if key in ledger.rows:
                     continue
                 if due <= utc_now() + timedelta(minutes=5):
-                    print(f"{key}: missed scheduling window")
-                    failures.append(key)
+                    if key not in failures:
+                        print(f"{key}: missed scheduling window")
+                        failures.append(key)
                     continue
                 try:
                     submit(ledger, buffer, channels[account], key, due, caption, images)
