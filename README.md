@@ -7,10 +7,10 @@ Automated LinkedIn publishing using Codex, Cloudinary, GitHub Actions and Buffer
 Each Karachi calendar day has four slots: Iffat Nazir at 10 AM and 5 PM,
 and ITRVIX at 10 AM and 5 PM. The corresponding Buffer targets are
 05:00 and 12:00 UTC. The workflow wakes hourly at minute 23 and queues
-future slots for today and tomorrow using Buffer's custom schedule. GitHub
-Actions can be delayed, so Buffer
-owns delivery at the scheduled timestamp. Missed slots are reported and
-require review.
+future slots for today and tomorrow only after Gmail review and approval.
+GitHub Actions can be delayed, so the workflow schedules ahead and Buffer
+owns delivery at the scheduled timestamp. Missed approved slots are
+reported and require review.
 
 ## Automatic daily research and production
 
@@ -32,11 +32,10 @@ require review.
   Pillow and DejaVu Sans. They contain illustrative workflows, review items,
   and decision prompts, without third-party photographs, logos, or figures.
   The audit records the image provenance and font information.
-- Only a complete four-post batch with twelve distinct PNGs reaches
-  scheduling. Failed research, fact-checks, or asset validation leave
-  the affected day unscheduled and visible in the Actions run. A later run
-  can retry while slots are still open. Once validated, the plan is committed
-  to the state branch before the first upload so retries reuse its content.
+- Only a complete generated batch with twelve distinct PNGs reaches Gmail
+  review. Failed research, fact-checks, or asset validation leave the affected
+  day unscheduled and visible in the Actions run. The workflow freezes
+  the reviewed plan so retries reuse its content.
 
 Daily files are optional. For an intentional override, add
 `content/YYYY-MM-DD/posts.json` and its images before the day is generated.
@@ -64,28 +63,40 @@ Buffer. By default the writer and reviewer use separate requests to
 `gpt-4.1-mini`; set `LINKEDIN_EDITORIAL_MODEL` to override it with a model
 that supports structured Chat Completions output.
 
-## Activation after approval
+## Gmail review and activation
 
-1. Connect Iffat Nazir's profile and the ITRVIX page in Buffer and confirm
-   the target channels can publish automatically. Use a Buffer personal API
-   key and the two corresponding LinkedIn channel IDs.
-2. In GitHub Actions settings, add repository **secrets** `BUFFER_API_KEY`,
-   `CLOUDINARY_API_KEY`, `CLOUDINARY_API_SECRET`, and `OPENAI_API_KEY`. Add repository
-   **variables** `BUFFER_IFFAT_CHANNEL_ID` and `BUFFER_ITRVIX_CHANNEL_ID`.
-   Keep `LINKEDIN_PUBLISHING_ENABLED` unset or `false` until approved.
-3. In Cloudinary cloud `ki5jtsz7`, confirm `linkedin_public_images` is a
-   signed preset for publicly deliverable image uploads. The application signs
-   the upload, uses content-addressed IDs with overwrite disabled, and checks
-   that the three resulting URLs each return an image without authentication.
-4. After this workflow lands on the default branch, dispatch **LinkedIn
-   publishing → initialize** once to create the durable state branch. This
-   operation writes only the empty ledger and can run while live posting is
-   disabled. Run **preview** to inspect a generated day before activation.
-5. After approval, set `LINKEDIN_PUBLISHING_ENABLED` to the exact value
-   `true`. Dispatch **run** for the first scheduling pass, or wait for the
-   hourly run. Set the variable back to `false` to stop further submissions
-   and polling. Posts already scheduled in Buffer remain scheduled and can be
-   managed in Buffer.
+1. After merging, dispatch **LinkedIn publishing → initialize** once to
+   create the durable state branch. Keep `LINKEDIN_PUBLISHING_ENABLED` unset
+   or `false` while configuring and testing email delivery.
+2. Add `OPENAI_API_KEY`, `GMAIL_REVIEW_ADDRESS`, and `GMAIL_APP_PASSWORD`
+   as GitHub Actions secrets. With Google's two-step verification enabled,
+   use a Gmail app password for the Gmail account that sends and receives the
+   review. Set repository variable `LINKEDIN_REVIEW_ENABLED` to `true`.
+   The first hourly run of each Karachi day prepares tomorrow's batch.
+   Dispatch **review** for an immediate email for tomorrow. A successful
+   send is recorded so later runs skip it. If Gmail accepted a message
+   during a network failure or before a state write failed, a retry may
+   send the same batch again.
+3. Read the four captions, source links, and twelve attachments in Gmail.
+   To approve, follow the email's GitHub Actions link, select **Run workflow**
+   on the default branch, choose **approve**, and enter the review date and
+   exact batch ID from the email. The repository owner approves by default.
+   Set `LINKEDIN_REVIEWER_LOGIN` only if another GitHub user with repository
+   access should approve. Gmail replies do not record approval.
+4. Approve before **9:55 AM Asia/Karachi** on the posting date. Leaving the
+   email unapproved skips all four posts. Each day requires its own approval.
+   The batch ID covers both accounts, times, captions, and ordered image
+   bytes. A mismatch after review blocks scheduling.
+5. Connect Iffat Nazir's profile and the ITRVIX page in Buffer. Add
+   `BUFFER_API_KEY`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` as
+   Actions secrets, and add `BUFFER_IFFAT_CHANNEL_ID` and
+   `BUFFER_ITRVIX_CHANNEL_ID` as Actions variables. Confirm that
+   `linkedin_public_images` is a signed, publicly deliverable upload preset
+   in Cloudinary cloud `ki5jtsz7`.
+6. Once ready for live posting, set `LINKEDIN_PUBLISHING_ENABLED` to
+   `true`. Approval then starts a scheduling pass, and hourly runs recover
+   and track approved batches. Setting this variable to `false` stops
+   new submissions. Posts already scheduled can be managed in Buffer.
 
 The API contract was checked against Buffer's
 [LinkedIn image specifications](https://support.buffer.com/articles/ideal-image-sizes-and-formats-for-your-buffer-posts-JxHNGZFvf9),
@@ -109,8 +120,10 @@ automatic delivery as `sent` with a `sentAt` timestamp. The ledger keeps the
 timestamp and the LinkedIn URL when available. Failed, unconfirmed, and
 overdue items surface in the workflow. The ledger stores fingerprints, status
 and identifiers. The state branch keeps captions and audit metadata in
-`editorial/YYYY-MM-DD.json`. It excludes Cloudinary image URLs and raw API
-error bodies.
+`editorial/YYYY-MM-DD.json` and email/approval metadata in
+`review/YYYY-MM-DD.json`. It excludes Gmail credentials, Cloudinary image
+URLs, and raw API error bodies. The state branch is public in a public
+repository. Use a private repository if drafts must remain private.
 
 A `submitting` entry without a Buffer ID means a prior submission may have
 reached Buffer. Review the matching channel's queue, drafts, failed and sent

@@ -1,6 +1,5 @@
-from datetime import date, datetime, timezone
+from datetime import date
 import json
-import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -100,24 +99,15 @@ class EditorialTests(unittest.TestCase):
             ledger.save.assert_called_once()
 
     @patch("editorial.generate_plan", side_effect=editorial.EditorialError("review rejected"))
-    @patch("publisher.submit")
-    @patch("publisher.Buffer")
-    @patch("publisher.open_ledger")
-    def test_failed_batch_never_uploads_or_submits(self, ledger, buffer, submit, plan):
-        state = ledger.return_value.__enter__.return_value
-        state.rows = {}
-        environment = {"LINKEDIN_PUBLISHING_ENABLED": "true", "BUFFER_IFFAT_CHANNEL_ID": "iffat",
-                       "BUFFER_ITRVIX_CHANNEL_ID": "itrvix"}
-        now = datetime(2026, 11, 20, 1, tzinfo=timezone.utc)
+    @patch("review.email_batch")
+    def test_failed_batch_never_emails(self, email_batch, plan):
         with tempfile.TemporaryDirectory() as directory:
-            state.checkout = Path(directory)
-            with (patch.dict(os.environ, environment), patch("sys.argv", ["publisher.py", "run"]),
-                  patch("publisher.utc_now", return_value=now)):
-                with self.assertRaisesRegex(SystemExit, "require review"):
-                    publisher.main()
-        submit.assert_not_called()
-        self.assertFalse(state.rows)
-        self.assertEqual(plan.call_count, 2)
+            ledger = Mock(checkout=Path(directory), rows={})
+            with self.assertRaisesRegex(editorial.EditorialError, "review rejected"):
+                publisher.send_review(ledger, Path(directory), DAY)
+        email_batch.assert_not_called()
+        ledger.save.assert_not_called()
+        plan.assert_called_once_with(DAY)
 
     @patch("publisher.open_ledger")
     @patch("publisher.Buffer")

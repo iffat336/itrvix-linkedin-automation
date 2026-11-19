@@ -17,6 +17,7 @@ from PIL import Image
 import requests
 
 import editorial
+import review
 
 KARACHI = ZoneInfo("Asia/Karachi")
 ACCOUNTS = {"iffat-nazir": "BUFFER_IFFAT_CHANNEL_ID", "itrvix": "BUFFER_ITRVIX_CHANNEL_ID"}
@@ -288,13 +289,15 @@ def generated_posts(plan, day, directory):
     return posts
 
 
-def prepare_day(ledger, root, day):
+def prepare_day(ledger, root, day, *, allow_generate=True):
     plan_path = ledger.checkout / "editorial" / f"{day}.json"
     if plan_path.is_file():
         plan = json.loads(plan_path.read_text(encoding="utf-8"))
     elif (root / day.isoformat() / "posts.json").is_file():
         return load_day(root, day)
     else:
+        if not allow_generate:
+            raise editorial.EditorialError("The batch content is missing")
         if any(key.startswith(f"{day}/") for key in ledger.rows):
             raise editorial.EditorialError("A day with existing reservations lacks its original editorial plan")
         plan = editorial.generate_plan(day)
@@ -308,12 +311,65 @@ def prepare_day(ledger, root, day):
     return posts
 
 
+def save_review(ledger, day, record, message):
+    path = review.record_path(ledger, day)
+    path.parent.mkdir(exist_ok=True)
+    path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+    git("add", str(path), cwd=ledger.checkout)
+    ledger.save(message)
+
+
+def send_review(ledger, root, day):
+    if review.read_record(ledger, day).get("emailed_at"):
+        print(f"{day}: review email already sent")
+        return
+    posts = prepare_day(ledger, root, day)
+    identifier = review.batch_id(day, posts)
+    review.email_batch(day, posts, identifier)
+    save_review(ledger, day, {"batch_id": identifier, "emailed_at": utc_now().isoformat()},
+                f"Record Gmail review email for {day}")
+    print(f"{day}: four posts submitted for Gmail review")
+
+
+def approve_day(ledger, root, day, identifier):
+    actor = os.environ.get("GITHUB_ACTOR", "")
+    triggering_actor = os.environ.get("GITHUB_TRIGGERING_ACTOR", "")
+    reviewer = os.environ.get("LINKEDIN_REVIEWER_LOGIN", "").casefold()
+    if not reviewer or {actor.casefold(), triggering_actor.casefold()} != {reviewer}:
+        raise RuntimeError("Only the configured GitHub reviewer can approve a batch")
+    record = review.read_record(ledger, day)
+    if not identifier or not record.get("emailed_at") or record.get("batch_id") != identifier:
+        raise RuntimeError("Approval requires the exact batch ID from the Gmail review email")
+    if review.batch_id(day, prepare_day(ledger, root, day, allow_generate=False)) != identifier:
+        raise RuntimeError("The captions or images changed after the review email")
+    if record.get("approved_at"):
+        print(f"{day}: batch already approved")
+        return
+    now = utc_now()
+    if now >= due_at(day, "10:00") - timedelta(minutes=5):
+        raise RuntimeError("The batch approval deadline (9:55 AM Asia/Karachi) has passed")
+    record.update(approved_at=now.isoformat(), approved_by=actor)
+    save_review(ledger, day, record, f"Approve emailed LinkedIn batch for {day}")
+    print(f"{day}: recorded approval for all four posts")
+
+
+def approved_posts(ledger, root, day):
+    record = review.read_record(ledger, day)
+    if not all(record.get(field) for field in ("emailed_at", "approved_at", "approved_by", "batch_id")):
+        return None
+    posts = prepare_day(ledger, root, day, allow_generate=False)
+    if review.batch_id(day, posts) != record["batch_id"]:
+        raise RuntimeError("The approved batch differs from the stored captions or images")
+    return posts
+
+
 def main():
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("operation", choices=("validate", "preview", "run", "initialize"), nargs="?", default="validate")
-    parser.add_argument("--date", type=date.fromisoformat, help="Karachi date for preview; defaults to tomorrow")
+    parser.add_argument("operation", choices=("validate", "preview", "review", "approve", "run", "initialize"), nargs="?", default="validate")
+    parser.add_argument("--date", type=date.fromisoformat, help="Karachi date for preview or approval")
     parser.add_argument("--output", type=Path, default=Path("editorial-preview"), help="Preview output directory")
+    parser.add_argument("--batch-id", help="Exact batch ID from the Gmail review email")
     args = parser.parse_args()
     root = Path("content")
     if args.operation == "validate":
@@ -333,6 +389,20 @@ def main():
             if ledger is not None:
                 ledger.save("Initialize LinkedIn publishing ledger")
         return
+    if args.operation == "review":
+        if os.environ.get("LINKEDIN_REVIEW_ENABLED") != "true":
+            print("Gmail review delivery is disabled")
+            return
+        tomorrow = utc_now().astimezone(KARACHI).date() + timedelta(days=1)
+        with open_ledger() as ledger:
+            send_review(ledger, root, tomorrow)
+        return
+    if args.operation == "approve":
+        if not args.date or not args.batch_id:
+            parser.error("approve requires --date and --batch-id")
+        with open_ledger() as ledger:
+            approve_day(ledger, root, args.date, args.batch_id)
+        return
     if os.environ.get("LINKEDIN_PUBLISHING_ENABLED") != "true":
         print("Live publishing is disabled")
         return
@@ -348,21 +418,16 @@ def main():
         for day in (today, tomorrow):
             missing_slots = [(account, slot) for account, slot in EXPECTED
                              if f"{day}/{account}/{slot}" not in ledger.rows]
-            for account, slot in missing_slots:
-                if due_at(day, slot) <= utc_now() + timedelta(minutes=5):
-                    key = f"{day}/{account}/{slot}"
-                    print(f"{key}: missed scheduling window")
-                    failures.append(key)
-            if not any(due_at(day, slot) > utc_now() + timedelta(minutes=5)
-                       for _, slot in missing_slots):
+            if not missing_slots:
                 continue
             try:
-                posts = prepare_day(ledger, root, day)
-            except (OSError, ValueError, KeyError, TypeError, editorial.EditorialError,
-                    requests.RequestException) as error:
-                details = f": {error}" if isinstance(error, editorial.EditorialError) else ""
-                print(f"{day}: editorial batch unavailable ({type(error).__name__}){details}")
+                posts = approved_posts(ledger, root, day)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                print(f"{day}: approved batch verification failed ({type(error).__name__})")
                 failures.append(day)
+                continue
+            if posts is None:
+                print(f"{day}: awaiting Gmail review approval")
                 continue
             for (account, slot), (caption, images) in sorted(posts.items()):
                 key = f"{day}/{account}/{slot}"
