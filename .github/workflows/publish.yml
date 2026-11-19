@@ -1,0 +1,64 @@
+name: LinkedIn publishing
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Operation
+        type: choice
+        options:
+          - validate
+          - initialize
+          - run
+        default: validate
+permissions:
+  contents: read
+concurrency:
+  group: linkedin-publishing
+  cancel-in-progress: false
+jobs:
+  validate:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'validate'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python publisher.py validate
+  initialize:
+    if: github.ref_name == github.event.repository.default_branch && github.event_name == 'workflow_dispatch' && inputs.operation == 'initialize'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python publisher.py initialize
+  publish:
+    if: >-
+      github.ref_name == github.event.repository.default_branch &&
+      vars.LINKEDIN_PUBLISHING_ENABLED == 'true' &&
+      (github.event_name == 'schedule' || inputs.operation == 'run')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python publisher.py run
+        env:
+          LINKEDIN_PUBLISHING_ENABLED: ${{ vars.LINKEDIN_PUBLISHING_ENABLED }}
+          BUFFER_API_KEY: ${{ secrets.BUFFER_API_KEY }}
+          BUFFER_IFFAT_CHANNEL_ID: ${{ vars.BUFFER_IFFAT_CHANNEL_ID }}
+          BUFFER_ITRVIX_CHANNEL_ID: ${{ vars.BUFFER_ITRVIX_CHANNEL_ID }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
